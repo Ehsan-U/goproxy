@@ -12,67 +12,126 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/elazarl/goproxy"
-	"github.com/redis/go-redis/v9"
 )
 
 const pidFile = "/tmp/goproxy.pid"
-
-type SubnetGenerator struct {
-	ipNet       *net.IPNet
-	redisClient *redis.Client
+type contextKey string
+const sessionKey contextKey = "session"
+type sessionEntry struct {
+	ip       net.IP
+	lastUsed time.Time
 }
 
-func NewSubnetGenerator(cidr string, redisClient *redis.Client) (*SubnetGenerator, error) {
+type SessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]*sessionEntry
+	ipNet    *net.IPNet
+	ttl      time.Duration
+}
+
+func NewSessionStore(cidr string, ttl time.Duration) (*SessionStore, error) {
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return nil, err
 	}
-	return &SubnetGenerator{ipNet: ipNet, redisClient: redisClient}, nil
+	s := &SessionStore{
+		sessions: make(map[string]*sessionEntry),
+		ipNet:    ipNet,
+		ttl:      ttl,
+	}
+	go s.cleanup()
+	return s, nil
 }
 
-func (s *SubnetGenerator) GetFallbackIP() net.IP {
-	val, err := s.redisClient.Get(context.Background(), "use_ip").Result()
-	if err == nil {
-		val = strings.Trim(val, "\"\n ")
-		if parsed := net.ParseIP(val); parsed != nil && s.ipNet.Contains(parsed) {
-			log.Println("[IP Select] Using IP from Redis:", parsed)
-			return parsed
+func (s *SessionStore) cleanup() {
+	for {
+		time.Sleep(60 * time.Second)
+		s.mu.Lock()
+		now := time.Now()
+		for id, entry := range s.sessions {
+			if now.Sub(entry.lastUsed) > s.ttl {
+				log.Println("[SESSION] expired:", id)
+				delete(s.sessions, id)
+			}
 		}
-		log.Println("[IP Reject] Redis IP invalid or out of subnet:", val)
-	} else {
-		log.Println("[DEBUG] Redis error or key not found:", err)
+		s.mu.Unlock()
 	}
-	return s.GenerateRandom()
 }
 
-func (s *SubnetGenerator) GenerateRandom() net.IP {
-	randIP := make(net.IP, len(s.ipNet.IP))
-	rand.Read(randIP)
-	ip := make(net.IP, len(s.ipNet.IP))
-	for i := range ip {
-		ip[i] = (s.ipNet.IP[i] & s.ipNet.Mask[i]) | (randIP[i] &^ s.ipNet.Mask[i])
+func (s *SessionStore) IPFor(session string) net.IP {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, ok := s.sessions[session]; ok {
+		entry.lastUsed = time.Now()
+		log.Println("[IP Session]", session, "->", entry.ip, "(cached)")
+		return entry.ip
 	}
-	log.Println("[IP Fallback] Using random IP:", ip)
+	ip := s.randomIP()
+	s.sessions[session] = &sessionEntry{ip: ip, lastUsed: time.Now()}
+	log.Println("[IP Session]", session, "->", ip, "(new)")
 	return ip
 }
 
-func loadWhitelist(path string) map[string]struct{} {
-	m := make(map[string]struct{})
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.Println("[WARN] could not load whitelist:", err)
-		return m
+func (s *SessionStore) RandomIP() net.IP {
+	ip := s.randomIP()
+	log.Println("[IP Random]", ip)
+	return ip
+}
+
+func (s *SessionStore) randomIP() net.IP {
+	randBytes := make([]byte, len(s.ipNet.IP))
+	rand.Read(randBytes)
+	ip := make(net.IP, len(s.ipNet.IP))
+	for i := range ip {
+		ip[i] = (s.ipNet.IP[i] & s.ipNet.Mask[i]) | (randBytes[i] &^ s.ipNet.Mask[i])
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if ip := strings.TrimSpace(line); ip != "" {
-			m[ip] = struct{}{}
+	return ip
+}
+
+func (s *SessionStore) HostCount() uint64 {
+	ones, bits := s.ipNet.Mask.Size()
+	hostBits := bits - ones
+	if hostBits <= 0 {
+		return 0
+	}
+	if hostBits >= 64 {
+		return ^uint64(0)
+	}
+	return 1 << uint(hostBits)
+}
+
+// parseAuth decodes Proxy-Authorization and returns (session, ok).
+// Username format: "user" or "user-sessionID"
+func parseAuth(header, proxyUser, proxyPass string) (string, bool) {
+	if !strings.HasPrefix(header, "Basic ") {
+		return "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(header[6:])
+	if err != nil {
+		return "", false
+	}
+	user, pass, ok := strings.Cut(string(decoded), ":")
+	if !ok || pass != proxyPass {
+		return "", false
+	}
+	// exact match
+	if user == proxyUser {
+		return "", true
+	}
+	// user-session-{value}
+	prefix := proxyUser + "-session-"
+	if strings.HasPrefix(user, prefix) {
+		session := strings.TrimPrefix(user, prefix)
+		if session != "" {
+			return session, true
 		}
 	}
-	return m
+	return "", false
 }
 
 func readPID() (int, error) {
@@ -89,8 +148,10 @@ func isRunning(pid int) bool {
 
 func cmdStart() {
 	if pid, err := readPID(); err == nil && isRunning(pid) {
-		fmt.Printf("already running (pid %d)\n", pid)
-		return
+		fmt.Printf("restarting (stopping pid %d)...\n", pid)
+		syscall.Kill(pid, syscall.SIGTERM)
+		os.Remove(pidFile)
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	for _, env := range []string{"SUBNETS", "PROXY_USER", "PROXY_PASS"} {
@@ -157,7 +218,12 @@ environment variables:
   PROXY_USER   basic auth username (required)
   PROXY_PASS   basic auth password (required)
   PROXY_PORT   listening port (default: 8080)
+  SESSION_TTL  sticky session duration in seconds (default: 600)
   LOG_FILE     log file path (default: goproxy.log)
+
+authentication:
+  user:pass              random IP each request
+  user-sessionID:pass    sticky IP per session ID
 `)
 }
 
@@ -194,76 +260,62 @@ func main() {
 	if subnet == "" {
 		log.Fatal("[FATAL] SUBNETS not set")
 	}
-	whitelist := loadWhitelist("whitelisted_ips.txt")
+	sessionTTL := 600 * time.Second
+	if v := os.Getenv("SESSION_TTL"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			sessionTTL = time.Duration(secs) * time.Second
+		}
+	}
 
-	redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	ipGen, err := NewSubnetGenerator(subnet, redisClient)
+	store, err := NewSessionStore(subnet, sessionTTL)
 	if err != nil {
 		log.Fatal("[FATAL] invalid SUBNETS:", err)
 	}
 
+	log.Printf("[BOOT] Subnet: %s (%d IPs), session TTL: %s\n", subnet, store.HostCount(), sessionTTL)
+
+	// HTTP requests
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		host, _, _ := net.SplitHostPort(req.RemoteAddr)
-		log.Println("[AUTH] from", host)
-		if _, ok := whitelist[host]; ok {
-			return req, nil
+		auth := req.Header.Get("Proxy-Authorization")
+		session, ok := parseAuth(auth, proxyUser, proxyPass)
+		if !ok {
+			log.Println("[DENIED]", host)
+			return req, goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusProxyAuthRequired, "407 Proxy Authentication Required")
 		}
-		if auth := req.Header.Get("Proxy-Authorization"); auth != "" {
-			expected := "Basic " + base64.StdEncoding.EncodeToString([]byte(proxyUser+":"+proxyPass))
-			if auth == expected {
-				return req, nil
-			}
-		}
-		log.Println("[DENIED]", host)
-		return req, goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusProxyAuthRequired, "407 Proxy Authentication Required")
+		ctx.UserData = session
+		return req, nil
 	})
 
+	// CONNECT (HTTPS) requests
 	proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
 		rHost, _, _ := net.SplitHostPort(ctx.Req.RemoteAddr)
-		log.Println("[AUTH-CONNECT] from", rHost)
-		if _, ok := whitelist[rHost]; ok {
-			log.Println("[ACCESS-CONNECT] whitelisted")
-		} else if auth := ctx.Req.Header.Get("Proxy-Authorization"); auth != "" {
-			expected := "Basic " + base64.StdEncoding.EncodeToString([]byte(proxyUser+":"+proxyPass))
-			if auth == expected {
-				log.Println("[ACCESS-CONNECT] authorized")
-			} else {
-				log.Println("[DENIED-CONNECT] invalid credentials")
-				return goproxy.RejectConnect, host
-			}
-		} else {
-			log.Println("[DENIED-CONNECT] no auth header and not whitelisted")
+		auth := ctx.Req.Header.Get("Proxy-Authorization")
+		session, ok := parseAuth(auth, proxyUser, proxyPass)
+		if !ok {
+			log.Println("[DENIED-CONNECT]", rHost)
 			return goproxy.RejectConnect, host
 		}
-		headIP := strings.TrimSpace(ctx.Req.Header.Get("use_ip"))
-		log.Println("[CONNECT header] use_ip=", headIP)
-		if headIP != "" {
-			return goproxy.OkConnect, headIP + "|" + host
+		if session != "" {
+			return goproxy.OkConnect, session + "|" + host
 		}
 		return goproxy.OkConnect, host
 	}))
 
+	// Dialer: pick IP based on session
 	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		parts := strings.SplitN(addr, "|", 2)
 		var ip net.IP
 		var hostPort string
 		if len(parts) == 2 {
-			ipStr := parts[0]
+			session := parts[0]
 			hostPort = parts[1]
-			if ipStr == "random" || ipStr == "" {
-				ip = ipGen.GenerateRandom()
-			} else if p := net.ParseIP(ipStr); p != nil && ipGen.ipNet.Contains(p) {
-				ip = p
-			} else {
-				log.Println("[CONNECT] invalid header IP, fallback to Redis")
-				ip = ipGen.GetFallbackIP()
-			}
+			ip = store.IPFor(session)
 		} else {
 			hostPort = addr
-			log.Println("[CONNECT] no header IP, fallback to Redis")
-			ip = ipGen.GetFallbackIP()
+			ip = store.RandomIP()
 		}
-		log.Println("[DIAL] binding:", ip, ">", hostPort)
+		log.Println("[DIAL] binding:", ip, "->", hostPort)
 		d := &net.Dialer{LocalAddr: &net.TCPAddr{IP: ip}, Timeout: 30 * time.Second}
 		return d.Dial(network, hostPort)
 	}
