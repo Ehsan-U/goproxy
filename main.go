@@ -254,25 +254,19 @@ func cmdStart() {
 	loadConfig()
 	promptAndSaveConfig()
 
-	logPath := os.Getenv("LOG_FILE")
-	if logPath == "" {
-		logPath = "goproxy.log"
-	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		fmt.Println("failed to open log file:", err)
-		os.Exit(1)
-	}
-
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(), "_DAEMON=1")
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
 		fmt.Println("failed to start:", err)
 		os.Exit(1)
 	}
 
+	logPath := os.Getenv("LOG_FILE")
+	if logPath == "" {
+		logPath = "goproxy.log"
+	}
 	os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
 	fmt.Printf("started (pid %d), logging to %s\n", cmd.Process.Pid, logPath)
 }
