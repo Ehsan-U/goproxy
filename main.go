@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,7 +110,6 @@ func (s *SessionStore) HostCount() uint64 {
 }
 
 // parseAuth decodes Proxy-Authorization and returns (session, ok).
-// Username format: "user" or "user-sessionID"
 func parseAuth(header, proxyUser, proxyPass string) (string, bool) {
 	if !strings.HasPrefix(header, "Basic ") {
 		return "", false
@@ -148,6 +149,60 @@ func isRunning(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
+func configPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "goproxy", "env")
+}
+
+func loadConfig() {
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			if os.Getenv(k) == "" {
+				os.Setenv(k, v)
+			}
+		}
+	}
+}
+
+func promptAndSaveConfig() {
+	reader := bufio.NewReader(os.Stdin)
+	required := []string{"SUBNETS", "PROXY_USER", "PROXY_PASS"}
+	prompted := false
+	for _, key := range required {
+		if os.Getenv(key) == "" {
+			fmt.Printf("%s: ", key)
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			if val == "" {
+				fmt.Printf("%s is required\n", key)
+				os.Exit(1)
+			}
+			os.Setenv(key, val)
+			prompted = true
+		}
+	}
+	if prompted {
+		path := configPath()
+		os.MkdirAll(filepath.Dir(path), 0755)
+		var lines []string
+		for _, key := range []string{"SUBNETS", "PROXY_USER", "PROXY_PASS", "PROXY_PORT", "SESSION_TTL", "LOG_FILE"} {
+			if v := os.Getenv(key); v != "" {
+				lines = append(lines, key+"="+v)
+			}
+		}
+		os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600)
+		fmt.Printf("config saved to %s\n", path)
+	}
+}
+
 func cmdStart() {
 	if pid, err := readPID(); err == nil && isRunning(pid) {
 		fmt.Printf("restarting (stopping pid %d)...\n", pid)
@@ -156,12 +211,8 @@ func cmdStart() {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	for _, env := range []string{"SUBNETS", "PROXY_USER", "PROXY_PASS"} {
-		if os.Getenv(env) == "" {
-			fmt.Printf("%s is not set\n", env)
-			os.Exit(1)
-		}
-	}
+	loadConfig()
+	promptAndSaveConfig()
 
 	logPath := os.Getenv("LOG_FILE")
 	if logPath == "" {
