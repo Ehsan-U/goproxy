@@ -19,6 +19,8 @@ import (
 	"github.com/elazarl/goproxy"
 )
 
+var version = "dev"
+
 const pidFile = "/tmp/goproxy.pid"
 type contextKey string
 const sessionKey contextKey = "session"
@@ -248,7 +250,7 @@ func main() {
 	}
 
 	// Daemon mode
-	log.Println("[BOOT] Proxy starting...")
+	log.Printf("[BOOT] Proxy %s starting...\n", version)
 
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = false
