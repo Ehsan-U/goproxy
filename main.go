@@ -24,6 +24,41 @@ import (
 var version = "dev"
 
 const pidFile = "/tmp/goproxy.pid"
+const maxLogSize = 50 * 1024 * 1024 // 50MB
+
+type rotatingWriter struct {
+	mu   sync.Mutex
+	path string
+	file *os.File
+	size int64
+}
+
+func newRotatingWriter(path string) (*rotatingWriter, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	info, _ := f.Stat()
+	return &rotatingWriter{path: path, file: f, size: info.Size()}, nil
+}
+
+func (w *rotatingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.size+int64(len(p)) > maxLogSize {
+		w.file.Close()
+		os.Rename(w.path, w.path+".1")
+		f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return 0, err
+		}
+		w.file = f
+		w.size = 0
+	}
+	n, err := w.file.Write(p)
+	w.size += int64(n)
+	return n, err
+}
 type contextKey string
 const sessionKey contextKey = "session"
 type sessionEntry struct {
@@ -300,7 +335,18 @@ func main() {
 		return
 	}
 
-	// Daemon mode
+	// Daemon mode — set up log rotation
+	logPath := os.Getenv("LOG_FILE")
+	if logPath == "" {
+		logPath = "goproxy.log"
+	}
+	logWriter, err := newRotatingWriter(logPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "failed to open log file:", err)
+		os.Exit(1)
+	}
+	log.SetOutput(logWriter)
+
 	log.Printf("[BOOT] Proxy %s starting...\n", version)
 
 	proxy := goproxy.NewProxyHttpServer()
