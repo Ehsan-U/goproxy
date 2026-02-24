@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -18,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chzyer/readline"
 	"github.com/elazarl/goproxy"
 )
 
@@ -208,13 +208,18 @@ func loadConfig() {
 }
 
 func promptAndSaveConfig() {
-	reader := bufio.NewReader(os.Stdin)
+	rl, err := readline.New("")
+	if err != nil {
+		fmt.Println("failed to init readline:", err)
+		os.Exit(1)
+	}
+	defer rl.Close()
 	required := []string{"SUBNETS", "PROXY_USER", "PROXY_PASS"}
 	prompted := false
 	for _, key := range required {
 		if os.Getenv(key) == "" {
-			fmt.Printf("%s: ", key)
-			val, _ := reader.ReadString('\n')
+			rl.SetPrompt(key + ": ")
+			val, _ := rl.Readline()
 			val = strings.TrimSpace(val)
 			if val == "" {
 				fmt.Printf("%s is required\n", key)
