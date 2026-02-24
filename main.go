@@ -5,27 +5,27 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/elazarl/goproxy"
 	"github.com/redis/go-redis/v9"
 )
 
-type contextKey string
-const userDataKey contextKey = "userData"
-
-// SubnetGenerator handles IP selection logic
+const pidFile = "/tmp/goproxy.pid"
 
 type SubnetGenerator struct {
 	ipNet       *net.IPNet
 	redisClient *redis.Client
 }
 
-// NewSubnetGenerator parses CIDR and returns a generator
 func NewSubnetGenerator(cidr string, redisClient *redis.Client) (*SubnetGenerator, error) {
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -34,23 +34,21 @@ func NewSubnetGenerator(cidr string, redisClient *redis.Client) (*SubnetGenerato
 	return &SubnetGenerator{ipNet: ipNet, redisClient: redisClient}, nil
 }
 
-// GetFallbackIP attempts Redis override, then random
 func (s *SubnetGenerator) GetFallbackIP() net.IP {
 	val, err := s.redisClient.Get(context.Background(), "use_ip").Result()
 	if err == nil {
 		val = strings.Trim(val, "\"\n ")
 		if parsed := net.ParseIP(val); parsed != nil && s.ipNet.Contains(parsed) {
-			fmt.Println("[IP Select] Using IP from Redis:", parsed)
+			log.Println("[IP Select] Using IP from Redis:", parsed)
 			return parsed
 		}
-		fmt.Println("[IP Reject] Redis IP invalid or out of subnet:", val)
+		log.Println("[IP Reject] Redis IP invalid or out of subnet:", val)
 	} else {
-		fmt.Println("[DEBUG] Redis error or key not found:", err)
+		log.Println("[DEBUG] Redis error or key not found:", err)
 	}
 	return s.GenerateRandom()
 }
 
-// GenerateRandom picks a random IP in the subnet
 func (s *SubnetGenerator) GenerateRandom() net.IP {
 	randIP := make(net.IP, len(s.ipNet.IP))
 	rand.Read(randIP)
@@ -58,16 +56,15 @@ func (s *SubnetGenerator) GenerateRandom() net.IP {
 	for i := range ip {
 		ip[i] = (s.ipNet.IP[i] & s.ipNet.Mask[i]) | (randIP[i] &^ s.ipNet.Mask[i])
 	}
-	fmt.Println("[IP Fallback] Using random IP:", ip)
+	log.Println("[IP Fallback] Using random IP:", ip)
 	return ip
 }
 
-// loadWhitelist reads whitelisted client IPs
 func loadWhitelist(path string) map[string]struct{} {
 	m := make(map[string]struct{})
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Println("[WARN] could not load whitelist:", err)
+		log.Println("[WARN] could not load whitelist:", err)
 		return m
 	}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -78,36 +75,129 @@ func loadWhitelist(path string) map[string]struct{} {
 	return m
 }
 
+func readPID() (int, error) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
+func isRunning(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+func cmdStart() {
+	if pid, err := readPID(); err == nil && isRunning(pid) {
+		fmt.Printf("already running (pid %d)\n", pid)
+		return
+	}
+
+	logPath := os.Getenv("LOG_FILE")
+	if logPath == "" {
+		logPath = "goproxy.log"
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Println("failed to open log file:", err)
+		os.Exit(1)
+	}
+
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), "_DAEMON=1")
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		fmt.Println("failed to start:", err)
+		os.Exit(1)
+	}
+
+	os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
+	fmt.Printf("started (pid %d), logging to %s\n", cmd.Process.Pid, logPath)
+}
+
+func cmdStop() {
+	pid, err := readPID()
+	if err != nil || !isRunning(pid) {
+		fmt.Println("not running")
+		os.Remove(pidFile)
+		return
+	}
+	syscall.Kill(pid, syscall.SIGTERM)
+	os.Remove(pidFile)
+	fmt.Printf("stopped (pid %d)\n", pid)
+}
+
+func cmdStatus() {
+	pid, err := readPID()
+	if err != nil || !isRunning(pid) {
+		fmt.Println("not running")
+		return
+	}
+	fmt.Printf("running (pid %d)\n", pid)
+}
+
+func printUsage() {
+	fmt.Print(`usage: goproxy <start|stop|status>
+
+commands:
+  start   start the proxy in the background
+  stop    stop a running proxy
+  status  check if the proxy is running
+
+environment variables:
+  SUBNETS      subnet CIDR for outbound IP binding (required)
+  PROXY_USER   basic auth username
+  PROXY_PASS   basic auth password
+  PROXY_PORT   listening port (default: 8080)
+  LOG_FILE     log file path (default: goproxy.log)
+`)
+}
+
 func main() {
-	fmt.Println("[BOOT] Proxy starting...")
-	// Initialize proxy server
+	if os.Getenv("_DAEMON") != "1" {
+		if len(os.Args) < 2 {
+			printUsage()
+			os.Exit(1)
+		}
+		switch os.Args[1] {
+		case "start":
+			cmdStart()
+		case "stop":
+			cmdStop()
+		case "status":
+			cmdStatus()
+		default:
+			printUsage()
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Daemon mode
+	log.Println("[BOOT] Proxy starting...")
+
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = false
 	proxy.Tr.IdleConnTimeout = 5 * time.Second
 
-	// Load configuration
 	proxyUser := os.Getenv("PROXY_USER")
 	proxyPass := os.Getenv("PROXY_PASS")
 	subnet := os.Getenv("SUBNETS")
 	if subnet == "" {
-		fmt.Println("[FATAL] SUBNETS not set")
-		return
+		log.Fatal("[FATAL] SUBNETS not set")
 	}
 	whitelist := loadWhitelist("whitelisted_ips.txt")
 
-	// Redis client and subnet generator
 	redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	ipGen, err := NewSubnetGenerator(subnet, redisClient)
 	if err != nil {
-		fmt.Println("[FATAL] invalid SUBNETS:", err)
-		return
+		log.Fatal("[FATAL] invalid SUBNETS:", err)
 	}
 
-	// HTTP auth & whitelist check
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		host, _, _ := net.SplitHostPort(req.RemoteAddr)
-		ctx.UserData = req
-		fmt.Println("[AUTH] from", host)
+		log.Println("[AUTH] from", host)
 		if _, ok := whitelist[host]; ok {
 			return req, nil
 		}
@@ -117,38 +207,35 @@ func main() {
 				return req, nil
 			}
 		}
-		fmt.Println("[DENIED]", host)
+		log.Println("[DENIED]", host)
 		return req, goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusProxyAuthRequired, "407 Proxy Authentication Required")
 	})
 
-	// CONNECT handler: auth + use_ip override
 	proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
 		rHost, _, _ := net.SplitHostPort(ctx.Req.RemoteAddr)
-		fmt.Println("[AUTH-CONNECT] from", rHost)
+		log.Println("[AUTH-CONNECT] from", rHost)
 		if _, ok := whitelist[rHost]; ok {
-			fmt.Println("[ACCESS-CONNECT] whitelisted")
+			log.Println("[ACCESS-CONNECT] whitelisted")
 		} else if auth := ctx.Req.Header.Get("Proxy-Authorization"); auth != "" {
 			expected := "Basic " + base64.StdEncoding.EncodeToString([]byte(proxyUser+":"+proxyPass))
 			if auth == expected {
-				fmt.Println("[ACCESS-CONNECT] authorized")
+				log.Println("[ACCESS-CONNECT] authorized")
 			} else {
-				fmt.Println("[DENIED-CONNECT] invalid credentials")
+				log.Println("[DENIED-CONNECT] invalid credentials")
 				return goproxy.RejectConnect, host
 			}
 		} else {
-			fmt.Println("[DENIED-CONNECT] no auth header and not whitelisted")
+			log.Println("[DENIED-CONNECT] no auth header and not whitelisted")
 			return goproxy.RejectConnect, host
 		}
-		// IP override
 		headIP := strings.TrimSpace(ctx.Req.Header.Get("use_ip"))
-		fmt.Println("[CONNECT header] use_ip=", headIP)
+		log.Println("[CONNECT header] use_ip=", headIP)
 		if headIP != "" {
 			return goproxy.OkConnect, headIP + "|" + host
 		}
 		return goproxy.OkConnect, host
 	}))
 
-	// Dialer: split decorated host, bind local IP
 	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		parts := strings.SplitN(addr, "|", 2)
 		var ip net.IP
@@ -161,15 +248,15 @@ func main() {
 			} else if p := net.ParseIP(ipStr); p != nil && ipGen.ipNet.Contains(p) {
 				ip = p
 			} else {
-				fmt.Println("[CONNECT] invalid header IP, fallback to Redis")
+				log.Println("[CONNECT] invalid header IP, fallback to Redis")
 				ip = ipGen.GetFallbackIP()
 			}
 		} else {
 			hostPort = addr
-			fmt.Println("[CONNECT] no header IP, fallback to Redis")
+			log.Println("[CONNECT] no header IP, fallback to Redis")
 			ip = ipGen.GetFallbackIP()
 		}
-		fmt.Println("[DIAL] binding:", ip, ">", hostPort)
+		log.Println("[DIAL] binding:", ip, ">", hostPort)
 		d := &net.Dialer{LocalAddr: &net.TCPAddr{IP: ip}, Timeout: 30 * time.Second}
 		return d.Dial(network, hostPort)
 	}
@@ -180,6 +267,6 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	fmt.Println("[BOOT] Listening on :" + port)
-	http.ListenAndServe(":"+port, proxy)
+	log.Println("[BOOT] Listening on :" + port)
+	log.Fatal(http.ListenAndServe(":"+port, proxy))
 }
