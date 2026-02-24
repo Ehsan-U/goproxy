@@ -207,6 +207,36 @@ func loadConfig() {
 	}
 }
 
+func listSubnets() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var subnets []string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			cidr := addr.String()
+			ip, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			ones, bits := ipNet.Mask.Size()
+			if ip.To4() != nil || ones == bits || !ip.IsGlobalUnicast() {
+				continue
+			}
+			subnets = append(subnets, ipNet.String())
+		}
+	}
+	return subnets
+}
+
 func promptAndSaveConfig() {
 	rl, err := readline.New("")
 	if err != nil {
@@ -214,9 +244,42 @@ func promptAndSaveConfig() {
 		os.Exit(1)
 	}
 	defer rl.Close()
-	required := []string{"SUBNETS", "PROXY_USER", "PROXY_PASS"}
 	prompted := false
-	for _, key := range required {
+
+	// Special handling for SUBNETS: show available subnets to pick from
+	if os.Getenv("SUBNETS") == "" {
+		subnets := listSubnets()
+		if len(subnets) > 0 {
+			fmt.Println("available subnets:")
+			for i, s := range subnets {
+				fmt.Printf("  %d) %s\n", i+1, s)
+			}
+			rl.SetPrompt("select subnet (number or enter manually): ")
+			val, _ := rl.Readline()
+			val = strings.TrimSpace(val)
+			if num, err := strconv.Atoi(val); err == nil && num >= 1 && num <= len(subnets) {
+				val = subnets[num-1]
+			}
+			if val == "" {
+				fmt.Println("SUBNETS is required")
+				os.Exit(1)
+			}
+			os.Setenv("SUBNETS", val)
+			prompted = true
+		} else {
+			rl.SetPrompt("SUBNETS: ")
+			val, _ := rl.Readline()
+			val = strings.TrimSpace(val)
+			if val == "" {
+				fmt.Println("SUBNETS is required")
+				os.Exit(1)
+			}
+			os.Setenv("SUBNETS", val)
+			prompted = true
+		}
+	}
+
+	for _, key := range []string{"PROXY_USER", "PROXY_PASS"} {
 		if os.Getenv(key) == "" {
 			rl.SetPrompt(key + ": ")
 			val, _ := rl.Readline()
