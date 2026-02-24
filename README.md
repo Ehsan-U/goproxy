@@ -21,8 +21,8 @@ goproxy status
 | Variable | Description | Default |
 |---|---|---|
 | `SUBNETS` | Subnet CIDR for outbound IP binding | required |
-| `PROXY_USER` | Basic auth username | |
-| `PROXY_PASS` | Basic auth password | |
+| `PROXY_USER` | Basic auth username | required |
+| `PROXY_PASS` | Basic auth password | required |
 | `PROXY_PORT` | Listening port | `8080` |
 | `LOG_FILE` | Log file path | `goproxy.log` |
 

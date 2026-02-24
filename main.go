@@ -93,6 +93,13 @@ func cmdStart() {
 		return
 	}
 
+	for _, env := range []string{"SUBNETS", "PROXY_USER", "PROXY_PASS"} {
+		if os.Getenv(env) == "" {
+			fmt.Printf("%s is not set\n", env)
+			os.Exit(1)
+		}
+	}
+
 	logPath := os.Getenv("LOG_FILE")
 	if logPath == "" {
 		logPath = "goproxy.log"
@@ -147,8 +154,8 @@ commands:
 
 environment variables:
   SUBNETS      subnet CIDR for outbound IP binding (required)
-  PROXY_USER   basic auth username
-  PROXY_PASS   basic auth password
+  PROXY_USER   basic auth username (required)
+  PROXY_PASS   basic auth password (required)
   PROXY_PORT   listening port (default: 8080)
   LOG_FILE     log file path (default: goproxy.log)
 `)
