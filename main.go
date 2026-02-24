@@ -296,7 +296,13 @@ func main() {
 		session, ok := parseAuth(auth, proxyUser, proxyPass)
 		if !ok {
 			log.Println("[DENIED-CONNECT]", rHost)
-			return goproxy.RejectConnect, host
+			return &goproxy.ConnectAction{
+				Action: goproxy.ConnectProxyAuthHijack,
+				Hijack: func(req *http.Request, client net.Conn, ctx *goproxy.ProxyCtx) {
+					client.Write([]byte("Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n"))
+					client.Close()
+				},
+			}, host
 		}
 		if session != "" {
 			return goproxy.OkConnect, session + "|" + host
