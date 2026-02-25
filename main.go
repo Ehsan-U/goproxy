@@ -218,7 +218,6 @@ func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
 			log.Printf("[HEALTH] subnet %s got 403 (hard blocked)", s.cidr)
 			return false
 		}
-		log.Printf("[HEALTH] subnet %s got 403 (challenge, not hard block)", s.cidr)
 		return true
 	}
 	return true
