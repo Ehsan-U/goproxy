@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -155,6 +156,25 @@ func (p *SubnetPool) healthLoop(s *Subnet, checkURL string, onUnhealthy func(*Su
 		} else if !wasHealthy && healthy {
 			log.Printf("[HEALTH] subnet %s recovered, marked HEALTHY", s.cidr)
 		}
+		if healthy {
+			sendHeartbeat("goproxy:" + s.cidr)
+		}
+	}
+}
+
+const monitorSocket = "/tmp/itxpmonitor.sock"
+
+func sendHeartbeat(app string) {
+	conn, err := net.DialTimeout("unix", monitorSocket, 2*time.Second)
+	if err != nil {
+		log.Printf("[HEARTBEAT] failed to connect to monitor socket: %v", err)
+		return
+	}
+	defer conn.Close()
+	msg, _ := json.Marshal(map[string]string{"type": "heartbeat", "app": app})
+	msg = append(msg, '\n')
+	if _, err := conn.Write(msg); err != nil {
+		log.Printf("[HEARTBEAT] failed to send for %s: %v", app, err)
 	}
 }
 
