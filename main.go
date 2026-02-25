@@ -210,6 +210,7 @@ func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
 }
 
 func isCloudflareHardBlock(body string) bool {
+	lower := strings.ToLower(body)
 	hardBlockSignals := []string{
 		"error code: 1005",
 		"error code: 1006",
@@ -218,12 +219,12 @@ func isCloudflareHardBlock(body string) bool {
 		"error code: 1009",
 		"error code: 1010",
 		"error code: 1012",
-		"Access denied",
-		"Sorry, you have been blocked",
-		"Your IP address is blocked",
+		"access denied",
+		"sorry, you have been blocked",
+		"your ip address is blocked",
 	}
 	for _, signal := range hardBlockSignals {
-		if strings.Contains(body, signal) {
+		if strings.Contains(lower, signal) {
 			return true
 		}
 	}
