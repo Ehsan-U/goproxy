@@ -28,5 +28,14 @@ chmod +x "$INSTALL_DIR/$BINARY"
 echo "installed to $INSTALL_DIR/$BINARY"
 
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
-    echo "note: add $INSTALL_DIR to your PATH"
+    SHELL_NAME=$(basename "$SHELL")
+    case "$SHELL_NAME" in
+        zsh)  RC="$HOME/.zshrc" ;;
+        *)    RC="$HOME/.bashrc" ;;
+    esac
+    if ! grep -q "$INSTALL_DIR" "$RC" 2>/dev/null; then
+        echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$RC"
+        echo "added $INSTALL_DIR to PATH in $RC"
+    fi
+    export PATH="$INSTALL_DIR:$PATH"
 fi
