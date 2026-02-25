@@ -227,16 +227,7 @@ func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
 func isCloudflareHardBlock(body string) bool {
 	lower := strings.ToLower(body)
 	hardBlockSignals := []string{
-		"error code: 1005",
-		"error code: 1006",
-		"error code: 1007",
-		"error code: 1008",
-		"error code: 1009",
-		"error code: 1010",
-		"error code: 1012",
-		"access denied",
 		"sorry, you have been blocked",
-		"your ip address is blocked",
 	}
 	for _, signal := range hardBlockSignals {
 		if strings.Contains(lower, signal) {
@@ -630,7 +621,7 @@ func main() {
 	}
 	healthCheckURL := os.Getenv("HEALTH_CHECK_URL")
 	if healthCheckURL == "" {
-		healthCheckURL = "http://1.1.1.1"
+		healthCheckURL = "https://truthsocial.com/robots.txt"
 	}
 
 	store, err := NewSessionStore(cidrs, sessionTTL, healthCheckURL)
