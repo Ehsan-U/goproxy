@@ -20,6 +20,9 @@ import (
 	"syscall"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/chzyer/readline"
 	"github.com/elazarl/goproxy"
 )
@@ -180,19 +183,28 @@ func sendHeartbeat(app string) {
 
 func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
 	ip := s.RandomIP()
-	dialer := &net.Dialer{
-		LocalAddr: &net.TCPAddr{IP: ip},
-		Timeout:   10 * time.Second,
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+		tls_client.WithClientProfile(profiles.Chrome_131),
+		tls_client.WithTimeoutSeconds(10),
+		tls_client.WithLocalAddr(*&net.TCPAddr{IP: ip}),
+		tls_client.WithForceHttp1(),
+		tls_client.WithDisableIPV4(),
+	)
+	if err != nil {
+		log.Printf("[HEALTH] subnet %s failed to create client: %v", s.cidr, err)
+		return false
 	}
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp6", addr)
-			},
-		},
+	req, err := fhttp.NewRequest(fhttp.MethodGet, checkURL, nil)
+	if err != nil {
+		log.Printf("[HEALTH] subnet %s failed to create request: %v", s.cidr, err)
+		return false
 	}
-	resp, err := client.Get(checkURL)
+	req.Header = fhttp.Header{
+		"user-agent":      {"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
+		"accept":          {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+		"accept-language": {"en-US,en;q=0.9"},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[HEALTH] subnet %s check failed: %v", s.cidr, err)
 		return false
