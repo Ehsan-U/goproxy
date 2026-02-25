@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -14,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -59,8 +62,146 @@ func (w *rotatingWriter) Write(p []byte) (int, error) {
 	w.size += int64(n)
 	return n, err
 }
-type contextKey string
-const sessionKey contextKey = "session"
+var ErrNoHealthySubnet = errors.New("no healthy subnets available")
+
+type Subnet struct {
+	cidr    string
+	ipNet   *net.IPNet
+	healthy atomic.Bool
+}
+
+func (s *Subnet) RandomIP() net.IP {
+	randBytes := make([]byte, len(s.ipNet.IP))
+	rand.Read(randBytes)
+	ip := make(net.IP, len(s.ipNet.IP))
+	for i := range ip {
+		ip[i] = (s.ipNet.IP[i] & s.ipNet.Mask[i]) | (randBytes[i] &^ s.ipNet.Mask[i])
+	}
+	return ip
+}
+
+func (s *Subnet) HostCount() uint64 {
+	ones, bits := s.ipNet.Mask.Size()
+	hostBits := bits - ones
+	if hostBits <= 0 {
+		return 0
+	}
+	if hostBits >= 64 {
+		return ^uint64(0)
+	}
+	return 1 << uint(hostBits)
+}
+
+type SubnetPool struct {
+	subnets []*Subnet
+	rrIndex atomic.Uint64
+}
+
+func NewSubnetPool(cidrs []string) (*SubnetPool, error) {
+	if len(cidrs) == 0 {
+		return nil, errors.New("no subnets provided")
+	}
+	p := &SubnetPool{}
+	for _, cidr := range cidrs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+		}
+		s := &Subnet{cidr: cidr, ipNet: ipNet}
+		s.healthy.Store(true)
+		p.subnets = append(p.subnets, s)
+	}
+	return p, nil
+}
+
+func (p *SubnetPool) NextHealthy() (*Subnet, error) {
+	n := uint64(len(p.subnets))
+	for i := uint64(0); i < n; i++ {
+		idx := p.rrIndex.Add(1) % n
+		if p.subnets[idx].healthy.Load() {
+			return p.subnets[idx], nil
+		}
+	}
+	return nil, ErrNoHealthySubnet
+}
+
+func (p *SubnetPool) HealthyCount() int {
+	count := 0
+	for _, s := range p.subnets {
+		if s.healthy.Load() {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *SubnetPool) StartHealthChecks(checkURL string, onUnhealthy func(*Subnet)) {
+	for _, s := range p.subnets {
+		go p.healthLoop(s, checkURL, onUnhealthy)
+	}
+}
+
+func (p *SubnetPool) healthLoop(s *Subnet, checkURL string, onUnhealthy func(*Subnet)) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		healthy := p.checkSubnet(s, checkURL)
+		wasHealthy := s.healthy.Load()
+		s.healthy.Store(healthy)
+		if wasHealthy && !healthy {
+			log.Printf("[HEALTH] subnet %s marked UNHEALTHY", s.cidr)
+			if onUnhealthy != nil {
+				onUnhealthy(s)
+			}
+		} else if !wasHealthy && healthy {
+			log.Printf("[HEALTH] subnet %s recovered, marked HEALTHY", s.cidr)
+		}
+		if healthy {
+			sendHeartbeat("goproxy:" + s.cidr)
+		}
+	}
+}
+
+const monitorSocket = "/tmp/itxpmonitor.sock"
+
+func sendHeartbeat(app string) {
+	conn, err := net.DialTimeout("unix", monitorSocket, 2*time.Second)
+	if err != nil {
+		log.Printf("[HEARTBEAT] failed to connect to monitor socket: %v", err)
+		return
+	}
+	defer conn.Close()
+	msg, _ := json.Marshal(map[string]string{"type": "heartbeat", "app": app})
+	msg = append(msg, '\n')
+	if _, err := conn.Write(msg); err != nil {
+		log.Printf("[HEARTBEAT] failed to send for %s: %v", app, err)
+	}
+}
+
+func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
+	ip := s.RandomIP()
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				LocalAddr: &net.TCPAddr{IP: ip},
+				Timeout:   10 * time.Second,
+			}).DialContext,
+		},
+	}
+	resp, err := client.Get(checkURL)
+	if err != nil {
+		log.Printf("[HEALTH] subnet %s check failed: %v", s.cidr, err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 403 {
+		log.Printf("[HEALTH] subnet %s got 403 (blocked)", s.cidr)
+		return false
+	}
+	return true
+}
+
 type sessionEntry struct {
 	ip       net.IP
 	lastUsed time.Time
@@ -69,21 +210,22 @@ type sessionEntry struct {
 type SessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]*sessionEntry
-	ipNet    *net.IPNet
+	pool     *SubnetPool
 	ttl      time.Duration
 }
 
-func NewSessionStore(cidr string, ttl time.Duration) (*SessionStore, error) {
-	_, ipNet, err := net.ParseCIDR(cidr)
+func NewSessionStore(cidrs []string, ttl time.Duration, checkURL string) (*SessionStore, error) {
+	pool, err := NewSubnetPool(cidrs)
 	if err != nil {
 		return nil, err
 	}
 	s := &SessionStore{
 		sessions: make(map[string]*sessionEntry),
-		ipNet:    ipNet,
+		pool:     pool,
 		ttl:      ttl,
 	}
 	go s.cleanup()
+	pool.StartHealthChecks(checkURL, s.evictSubnet)
 	return s, nil
 }
 
@@ -102,46 +244,45 @@ func (s *SessionStore) cleanup() {
 	}
 }
 
-func (s *SessionStore) IPFor(session string) net.IP {
+func (s *SessionStore) evictSubnet(sub *Subnet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for id, entry := range s.sessions {
+		if sub.ipNet.Contains(entry.ip) {
+			delete(s.sessions, id)
+			count++
+		}
+	}
+	log.Printf("[EVICT] removed %d sessions from subnet %s", count, sub.cidr)
+}
+
+func (s *SessionStore) IPFor(session string) (net.IP, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry, ok := s.sessions[session]; ok {
 		entry.lastUsed = time.Now()
 		log.Println("[IP Session]", session, "->", entry.ip, "(cached)")
-		return entry.ip
+		return entry.ip, nil
 	}
-	ip := s.randomIP()
+	subnet, err := s.pool.NextHealthy()
+	if err != nil {
+		return nil, err
+	}
+	ip := subnet.RandomIP()
 	s.sessions[session] = &sessionEntry{ip: ip, lastUsed: time.Now()}
-	log.Println("[IP Session]", session, "->", ip, "(new)")
-	return ip
+	log.Printf("[IP Session] %s -> %s (new, subnet %s)", session, ip, subnet.cidr)
+	return ip, nil
 }
 
-func (s *SessionStore) RandomIP() net.IP {
-	ip := s.randomIP()
-	log.Println("[IP Random]", ip)
-	return ip
-}
-
-func (s *SessionStore) randomIP() net.IP {
-	randBytes := make([]byte, len(s.ipNet.IP))
-	rand.Read(randBytes)
-	ip := make(net.IP, len(s.ipNet.IP))
-	for i := range ip {
-		ip[i] = (s.ipNet.IP[i] & s.ipNet.Mask[i]) | (randBytes[i] &^ s.ipNet.Mask[i])
+func (s *SessionStore) RandomIP() (net.IP, error) {
+	subnet, err := s.pool.NextHealthy()
+	if err != nil {
+		return nil, err
 	}
-	return ip
-}
-
-func (s *SessionStore) HostCount() uint64 {
-	ones, bits := s.ipNet.Mask.Size()
-	hostBits := bits - ones
-	if hostBits <= 0 {
-		return 0
-	}
-	if hostBits >= 64 {
-		return ^uint64(0)
-	}
-	return 1 << uint(hostBits)
+	ip := subnet.RandomIP()
+	log.Printf("[IP Random] %s (subnet %s)", ip, subnet.cidr)
+	return ip, nil
 }
 
 // parseAuth decodes Proxy-Authorization and returns (session, ok).
@@ -254,20 +395,29 @@ func promptAndSaveConfig() {
 			for i, s := range subnets {
 				fmt.Printf("  %d) %s\n", i+1, s)
 			}
-			rl.SetPrompt("select subnet (number or enter manually): ")
+			rl.SetPrompt("select subnets (comma-separated numbers or CIDRs): ")
 			val, _ := rl.Readline()
 			val = strings.TrimSpace(val)
-			if num, err := strconv.Atoi(val); err == nil && num >= 1 && num <= len(subnets) {
-				val = subnets[num-1]
+			var selected []string
+			for _, token := range strings.Split(val, ",") {
+				token = strings.TrimSpace(token)
+				if token == "" {
+					continue
+				}
+				if num, err := strconv.Atoi(token); err == nil && num >= 1 && num <= len(subnets) {
+					selected = append(selected, subnets[num-1])
+				} else {
+					selected = append(selected, token)
+				}
 			}
-			if val == "" {
+			if len(selected) == 0 {
 				fmt.Println("SUBNETS is required")
 				os.Exit(1)
 			}
-			os.Setenv("SUBNETS", val)
+			os.Setenv("SUBNETS", strings.Join(selected, ","))
 			prompted = true
 		} else {
-			rl.SetPrompt("SUBNETS: ")
+			rl.SetPrompt("SUBNETS (comma-separated CIDRs): ")
 			val, _ := rl.Readline()
 			val = strings.TrimSpace(val)
 			if val == "" {
@@ -296,7 +446,7 @@ func promptAndSaveConfig() {
 		path := configPath()
 		os.MkdirAll(filepath.Dir(path), 0755)
 		var lines []string
-		for _, key := range []string{"SUBNETS", "PROXY_USER", "PROXY_PASS", "PROXY_PORT", "SESSION_TTL", "LOG_FILE"} {
+		for _, key := range []string{"SUBNETS", "PROXY_USER", "PROXY_PASS", "PROXY_PORT", "SESSION_TTL", "LOG_FILE", "HEALTH_CHECK_URL"} {
 			if v := os.Getenv(key); v != "" {
 				lines = append(lines, key+"="+v)
 			}
@@ -364,7 +514,8 @@ commands:
   status  check if the proxy is running
 
 environment variables:
-  SUBNETS      subnet CIDR for outbound IP binding (required)
+  SUBNETS           comma-separated subnet CIDRs for outbound IPs (required)
+  HEALTH_CHECK_URL  URL for subnet health checks (default: http://1.1.1.1)
   PROXY_USER   basic auth username (required)
   PROXY_PASS   basic auth password (required)
   PROXY_PORT   listening port (default: 8080)
@@ -417,9 +568,15 @@ func main() {
 
 	proxyUser := os.Getenv("PROXY_USER")
 	proxyPass := os.Getenv("PROXY_PASS")
-	subnet := os.Getenv("SUBNETS")
-	if subnet == "" {
+	subnetStr := os.Getenv("SUBNETS")
+	if subnetStr == "" {
 		log.Fatal("[FATAL] SUBNETS not set")
+	}
+	var cidrs []string
+	for _, c := range strings.Split(subnetStr, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			cidrs = append(cidrs, c)
+		}
 	}
 	sessionTTL := 600 * time.Second
 	if v := os.Getenv("SESSION_TTL"); v != "" {
@@ -427,13 +584,20 @@ func main() {
 			sessionTTL = time.Duration(secs) * time.Second
 		}
 	}
-
-	store, err := NewSessionStore(subnet, sessionTTL)
-	if err != nil {
-		log.Fatal("[FATAL] invalid SUBNETS:", err)
+	healthCheckURL := os.Getenv("HEALTH_CHECK_URL")
+	if healthCheckURL == "" {
+		healthCheckURL = "http://1.1.1.1"
 	}
 
-	log.Printf("[BOOT] Subnet: %s (%d IPs), session TTL: %s\n", subnet, store.HostCount(), sessionTTL)
+	store, err := NewSessionStore(cidrs, sessionTTL, healthCheckURL)
+	if err != nil {
+		log.Fatal("[FATAL] invalid SUBNETS: ", err)
+	}
+
+	for _, s := range store.pool.subnets {
+		log.Printf("[BOOT] Subnet: %s (%d IPs)", s.cidr, s.HostCount())
+	}
+	log.Printf("[BOOT] %d subnets loaded, session TTL: %s, health check: %s", len(cidrs), sessionTTL, healthCheckURL)
 
 	// HTTP requests
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
@@ -443,6 +607,10 @@ func main() {
 		if !ok {
 			log.Println("[DENIED]", host)
 			return req, goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusProxyAuthRequired, "407 Proxy Authentication Required")
+		}
+		if store.pool.HealthyCount() == 0 {
+			log.Println("[BLOCKED] no healthy subnets, returning 503")
+			return req, goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusServiceUnavailable, "503 Service Unavailable - all subnets blocked")
 		}
 		ctx.UserData = session
 		return req, nil
@@ -474,13 +642,16 @@ func main() {
 		parts := strings.SplitN(addr, "|", 2)
 		var ip net.IP
 		var hostPort string
+		var ipErr error
 		if len(parts) == 2 {
-			session := parts[0]
 			hostPort = parts[1]
-			ip = store.IPFor(session)
+			ip, ipErr = store.IPFor(parts[0])
 		} else {
 			hostPort = addr
-			ip = store.RandomIP()
+			ip, ipErr = store.RandomIP()
+		}
+		if ipErr != nil {
+			return nil, fmt.Errorf("no healthy subnets: %w", ipErr)
 		}
 		log.Println("[DIAL] binding:", ip, "->", hostPort)
 		d := &net.Dialer{LocalAddr: &net.TCPAddr{IP: ip}, Timeout: 30 * time.Second}
