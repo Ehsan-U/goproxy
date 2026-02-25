@@ -160,7 +160,7 @@ func (p *SubnetPool) healthLoop(s *Subnet, checkURL string, onUnhealthy func(*Su
 			log.Printf("[HEALTH] subnet %s recovered, marked HEALTHY", s.cidr)
 		}
 		if healthy {
-			sendHeartbeat("goproxy:" + s.cidr)
+			sendHeartbeat(s.cidr)
 		}
 	}
 }
