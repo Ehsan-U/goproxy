@@ -206,8 +206,8 @@ func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[HEALTH] subnet %s check failed: %v", s.cidr, err)
-		return false
+		log.Printf("[HEALTH] subnet %s check failed (network error, staying healthy): %v", s.cidr, err)
+		return true
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 403 {
