@@ -180,13 +180,16 @@ func sendHeartbeat(app string) {
 
 func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
 	ip := s.RandomIP()
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: ip},
+		Timeout:   10 * time.Second,
+	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				LocalAddr: &net.TCPAddr{IP: ip},
-				Timeout:   10 * time.Second,
-			}).DialContext,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp6", addr)
+			},
 		},
 	}
 	resp, err := client.Get(checkURL)
