@@ -196,10 +196,38 @@ func (p *SubnetPool) checkSubnet(s *Subnet, checkURL string) bool {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 403 {
-		log.Printf("[HEALTH] subnet %s got 403 (blocked)", s.cidr)
-		return false
+		body := make([]byte, 4096)
+		n, _ := resp.Body.Read(body)
+		page := string(body[:n])
+		if isCloudflareHardBlock(page) {
+			log.Printf("[HEALTH] subnet %s got 403 (hard blocked)", s.cidr)
+			return false
+		}
+		log.Printf("[HEALTH] subnet %s got 403 (challenge, not hard block)", s.cidr)
+		return true
 	}
 	return true
+}
+
+func isCloudflareHardBlock(body string) bool {
+	hardBlockSignals := []string{
+		"error code: 1005",
+		"error code: 1006",
+		"error code: 1007",
+		"error code: 1008",
+		"error code: 1009",
+		"error code: 1010",
+		"error code: 1012",
+		"Access denied",
+		"Sorry, you have been blocked",
+		"Your IP address is blocked",
+	}
+	for _, signal := range hardBlockSignals {
+		if strings.Contains(body, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 type sessionEntry struct {
